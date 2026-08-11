@@ -1,4 +1,4 @@
-name: smart_glasses_detection
+name: glance
 description: "A new Flutter project."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
@@ -40,6 +40,7 @@ dependencies:
   shared_preferences: ^2.5.5
   permission_handler: ^11.3.0
   wakelock_plus: ^1.7.0
+  flutter_blue_plus: ^2.3.12
 
 dev_dependencies:
   flutter_test:
