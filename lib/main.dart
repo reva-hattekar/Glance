@@ -1,3 +1,7 @@
+import 'dart:io';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:image/image.dart' as img;
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -87,6 +91,26 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   bool _isCameraInitialized = false;
   bool _isCameraStarting = false;
 
+  // ===== REAL COMPUTER VISION =====
+FaceDetector? _faceDetector;
+Interpreter? _glassesInterpreter;
+
+bool _isProcessingFrame = false;
+int _frameCounter = 0;
+
+bool _personDetected = false;
+bool _interactionDetected = false;
+
+double _liveDistance = 0.0;
+double _liveOrientation = 0.0;
+double _liveDuration = 0.0;
+double _liveSmartGlassesProb = 0.0;
+
+DateTime? _interactionStart;
+
+double _lastFaceX = 0.0;
+double _movement = 0.0;
+
   // Logs & Polling
   List<String> _alertsLog = [];
   Timer? _pendingAlarmPoller;
@@ -104,9 +128,13 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   String _riskLevel = "LOW RISK";
 
   @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
+void initState() {
+  super.initState();
+
+  _initFaceDetection();
+  _initGlassesModel();
+
+  WidgetsBinding.instance.addObserver(this);
     _initializePermissionsAndStatus();
     _loadAlertLogs();
     
@@ -121,6 +149,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     WidgetsBinding.instance.removeObserver(this);
     _pendingAlarmPoller?.cancel();
     _disposeCamera();
+    _faceDetector?.close();
     super.dispose();
   }
 
@@ -131,6 +160,189 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       _checkPendingBackgroundAlarm();
     }
   }
+
+  Future<void> _initFaceDetection() async {
+  _faceDetector = FaceDetector(
+    options: FaceDetectorOptions(
+      performanceMode: FaceDetectorMode.fast,
+      enableTracking: true,
+      enableLandmarks: false,
+      enableContours: false,
+      enableClassification: false,
+    ),
+  );
+
+  debugPrint("FACE DETECTOR READY");
+}
+
+Future<void> _initGlassesModel() async {
+  debugPrint("GLASSES MODEL FUNCTION CALLED");
+  try {
+    _glassesInterpreter = await Interpreter.fromAsset(
+      'assets/smart_glasses.tflite',
+    );
+
+    final input = _glassesInterpreter!.getInputTensor(0);
+    final output = _glassesInterpreter!.getOutputTensor(0);
+
+    debugPrint('===== GLASSES MODEL =====');
+    debugPrint('Input shape: ${input.shape}');
+    debugPrint('Input type: ${input.type}');
+    debugPrint('Output shape: ${output.shape}');
+    debugPrint('Output type: ${output.type}');
+    debugPrint('=========================');
+  } catch (e) {
+    debugPrint('GLASSES MODEL ERROR: $e');
+  }
+}
+
+Future<void> _runGlassesModel(
+  CameraImage cameraImage,
+  Rect faceBox,
+) async {
+  if (_glassesInterpreter == null) return;
+
+  try {
+    // Convert NV21 camera frame → RGB image
+    final rgbImage = _nv21ToRgb(cameraImage);
+
+    if (rgbImage == null) return;
+
+    // Convert ML Kit face coordinates to integers
+    int x = faceBox.left.round();
+    int y = faceBox.top.round();
+    int width = faceBox.width.round();
+    int height = faceBox.height.round();
+
+    // Add some padding around the face.
+    // This gives the model a little more context around the glasses.
+    final paddingX = (width * 0.15).round();
+    final paddingY = (height * 0.15).round();
+
+    x -= paddingX;
+    y -= paddingY;
+    width += paddingX * 2;
+    height += paddingY * 2;
+
+    // Keep crop inside image boundaries
+    x = x.clamp(0, rgbImage.width - 1);
+    y = y.clamp(0, rgbImage.height - 1);
+
+    width = width.clamp(1, rgbImage.width - x);
+    height = height.clamp(1, rgbImage.height - y);
+
+    final faceCrop = img.copyCrop(
+      rgbImage,
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+    );
+
+    // Resize to EXACTLY what the model expects
+    final resized = img.copyResize(
+      faceCrop,
+      width: 224,
+      height: 224,
+      interpolation: img.Interpolation.linear,
+    );
+
+    // Build [1, 224, 224, 3]
+    final input = List.generate(
+      1,
+      (_) => List.generate(
+        224,
+        (y) => List.generate(
+          224,
+          (x) {
+            final pixel = resized.getPixel(x, y);
+
+            return [
+              pixel.r.toDouble(),
+              pixel.g.toDouble(),
+              pixel.b.toDouble(),
+            ];
+          },
+        ),
+      ),
+    );
+
+    final output = [
+      [0.0]
+    ];
+
+    _glassesInterpreter!.run(input, output);
+
+    final probability = output[0][0].toDouble();
+
+    debugPrint(
+      "👓 GLASSES MODEL → "
+      "${(probability * 100).toStringAsFixed(1)}%",
+    );
+
+    if (!mounted) return;
+
+    setState(() {
+      _liveSmartGlassesProb = probability * 100;
+    });
+  } catch (e, stackTrace) {
+    debugPrint("GLASSES MODEL ERROR: $e");
+    debugPrint("$stackTrace");
+  }
+}
+
+img.Image? _nv21ToRgb(CameraImage image) {
+  try {
+    final width = image.width;
+    final height = image.height;
+    final bytes = image.planes.first.bytes;
+
+    final rgb = img.Image(
+      width: width,
+      height: height,
+    );
+
+    final frameSize = width * height;
+
+    for (int y = 0; y < height; y++) {
+      final uvRow = frameSize + (y >> 1) * width;
+
+      for (int x = 0; x < width; x++) {
+        final yIndex = y * width + x;
+
+        int yValue = bytes[yIndex] & 0xff;
+
+        final uvIndex = uvRow + (x & ~1);
+
+        int v = bytes[uvIndex] & 0xff;
+        int u = bytes[uvIndex + 1] & 0xff;
+
+        yValue = yValue < 16 ? 16 : yValue;
+
+        final r = (1.164 * (yValue - 16) + 1.596 * (v - 128))
+            .round()
+            .clamp(0, 255);
+
+        final g = (1.164 * (yValue - 16) -
+                0.813 * (v - 128) -
+                0.391 * (u - 128))
+            .round()
+            .clamp(0, 255);
+
+        final b = (1.164 * (yValue - 16) + 2.018 * (u - 128))
+            .round()
+            .clamp(0, 255);
+
+        rgb.setPixelRgb(x, y, r, g, b);
+      }
+    }
+
+    return rgb;
+  } catch (e) {
+    debugPrint("NV21 → RGB ERROR: $e");
+    return null;
+  }
+}
 
   // --- Initialization Helper ---
   Future<void> _initializePermissionsAndStatus() async {
@@ -190,6 +402,163 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     }
   }
 
+  Future<void> _processCameraImage(CameraImage image) async {
+  if (_isProcessingFrame || _faceDetector == null) return;
+
+  _frameCounter++;
+
+  // Process roughly every 5th frame.
+  if (_frameCounter % 5 != 0) return;
+
+  _isProcessingFrame = true;
+
+  try {
+    final inputImage = _convertCameraImage(image);
+
+    if (inputImage == null) return;
+
+    debugPrint("CV ✓ Sending frame to ML Kit");
+
+final faces =
+    await _faceDetector!.processImage(inputImage);
+
+debugPrint("CV ✓ Faces found: ${faces.length}");
+
+    if (!mounted) return;
+
+    // =========================
+    // NO PERSON
+    // =========================
+
+    if (faces.isEmpty) {
+  setState(() {
+    _personDetected = false;
+    _interactionDetected = false;
+    _liveDistance = 0;
+    _liveOrientation = 0;
+    _liveDuration = 0;
+    _liveSmartGlassesProb = 0;
+    _movement = 0;
+  });
+
+  _interactionStart = null;
+  return;
+}
+
+    // Pick the largest face
+    faces.sort(
+      (a, b) =>
+          b.boundingBox.width.compareTo(a.boundingBox.width),
+    );
+
+    final face = faces.first;
+    final box = face.boundingBox;
+    await _runGlassesModel(image, box);
+
+    // =========================
+    // 1. DISTANCE
+    // =========================
+
+    final imageWidth = image.width.toDouble();
+
+    final faceRatio = box.width / imageWidth;
+
+    double distance;
+
+    if (faceRatio > 0.65) {
+      distance = 0.5;
+    } else if (faceRatio > 0.50) {
+      distance = 0.8;
+    } else if (faceRatio > 0.35) {
+      distance = 1.2;
+    } else if (faceRatio > 0.25) {
+      distance = 1.8;
+    } else if (faceRatio > 0.18) {
+      distance = 2.5;
+    } else {
+      distance = 3.5;
+    }
+
+    // =========================
+// 2. INTERACTION
+// =========================
+
+const interactionThreshold = 7.0;
+
+final closeEnough = distance <= 2.5;
+
+if (closeEnough) {
+  _interactionStart ??= DateTime.now();
+
+  _liveDuration =
+      DateTime.now()
+              .difference(_interactionStart!)
+              .inMilliseconds /
+          1000.0;
+
+  // Interaction only becomes TRUE after sustained proximity
+  _interactionDetected =
+      _liveDuration >= interactionThreshold;
+} else {
+  _interactionStart = null;
+  _interactionDetected = false;
+  _liveDuration = 0;
+}
+
+    // =========================
+    // 3. ORIENTATION
+    // =========================
+
+    final yaw = face.headEulerAngleY ?? 90.0;
+    final pitch = face.headEulerAngleX ?? 90.0;
+
+    final yawScore =
+        (1 - (yaw.abs() / 45.0)).clamp(0.0, 1.0);
+
+    final pitchScore =
+        (1 - (pitch.abs() / 30.0)).clamp(0.0, 1.0);
+
+    final orientation =
+        ((yawScore * 0.7) + (pitchScore * 0.3)) * 100;
+
+    // =========================
+    // 4. MOVEMENT
+    // =========================
+
+    final currentX = box.center.dx;
+
+    _movement =
+        (_lastFaceX == 0)
+            ? 0
+            : (currentX - _lastFaceX).abs();
+
+    _lastFaceX = currentX;
+
+    // =========================
+    // UPDATE
+    // =========================
+
+    setState(() {
+  _personDetected = true;
+  _liveDistance = distance;
+  _liveOrientation = orientation;
+});
+
+_calculateLiveRisk();
+    debugPrint(
+      "FACE ✓ | "
+      "Distance: ${distance.toStringAsFixed(1)}m | "
+      "Orientation: ${orientation.toStringAsFixed(0)} | "
+      "Duration: ${_liveDuration.toStringAsFixed(1)}s",
+    );
+
+  } catch (e) {
+    debugPrint("Face processing error: $e");
+  } finally {
+    _isProcessingFrame = false;
+  }
+}
+
   Future<void> _checkPendingBackgroundAlarm() async {
     try {
       final bool hasPending = await platform.invokeMethod('consumePendingAlarm');
@@ -241,13 +610,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     } catch (_) {}
 
     _cameraController = CameraController(
-      _cameras.first,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
+  _cameras.first,
+  ResolutionPreset.low,
+  enableAudio: false,
+  imageFormatGroup: ImageFormatGroup.nv21,
+);
 
     try {
       await _cameraController!.initialize();
+      await _cameraController!.startImageStream(_processCameraImage);
       if (!mounted) return;
       setState(() {
         _isCameraInitialized = true;
@@ -277,6 +648,84 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       await platform.invokeMethod('setAppUsingCamera', {'using': false});
     } catch (_) {}
   }
+
+  InputImage? _convertCameraImage(CameraImage image) {
+  if (!Platform.isAndroid) return null;
+
+  if (_cameraController == null) return null;
+
+  if (image.planes.length != 1) {
+    debugPrint(
+      "CV ❌ Wrong plane count: ${image.planes.length}",
+    );
+    return null;
+  }
+  final camera = _cameras.first;
+
+  final rotationMap = {
+    DeviceOrientation.portraitUp: 0,
+    DeviceOrientation.landscapeLeft: 90,
+    DeviceOrientation.portraitDown: 180,
+    DeviceOrientation.landscapeRight: 270,
+  };
+
+  var rotationCompensation =
+      rotationMap[
+        _cameraController!.value.deviceOrientation
+      ];
+
+  if (rotationCompensation == null) return null;
+
+  if (camera.lensDirection ==
+      CameraLensDirection.front) {
+    rotationCompensation =
+        (camera.sensorOrientation +
+                rotationCompensation) %
+            360;
+  } else {
+    rotationCompensation =
+        (camera.sensorOrientation -
+                rotationCompensation +
+                360) %
+            360;
+  }
+
+  final rotation =
+      InputImageRotationValue.fromRawValue(
+        rotationCompensation,
+      );
+
+  if (rotation == null) return null;
+
+  final format =
+      InputImageFormatValue.fromRawValue(
+        image.format.raw,
+      );
+
+  if (format == null) return null;
+
+  if (format != InputImageFormat.nv21) {
+  debugPrint(
+    "CV ❌ Wrong image format: ${image.format.raw}",
+  );
+  return null;
+}
+
+  final plane = image.planes.first;
+
+  return InputImage.fromBytes(
+    bytes: plane.bytes,
+    metadata: InputImageMetadata(
+      size: Size(
+        image.width.toDouble(),
+        image.height.toDouble(),
+      ),
+      rotation: rotation,
+      format: format,
+      bytesPerRow: plane.bytesPerRow,
+    ),
+  );
+}
 
   // --- Risk Engine Calculation ---
   void _calculateRisk() {
@@ -332,6 +781,107 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       _triggerAlarmLocal("Simulated threat level reached HIGH ($finalScore%)");
     }
   }
+
+  void _calculateLiveRisk() {
+  if (!_isLiveMode || !_personDetected) {
+    return;
+  }
+
+  double score = 0;
+
+  // =========================
+  // 1. DISTANCE — 25 points
+  // =========================
+
+  if (_liveDistance <= 2.0) {
+    final distFactor =
+        ((2.0 - _liveDistance) / 1.5).clamp(0.0, 1.0);
+
+    score += 10 + (distFactor * 15);
+  }
+
+  // =========================
+  // 2. INTERACTION — 15 points
+  // =========================
+
+  if (_interactionDetected) {
+    score += 15;
+  }
+
+  // =========================
+  // 3. ORIENTATION — 15 points
+  // =========================
+
+  score += _liveOrientation * 0.15;
+
+  // =========================
+  // 4. SMART GLASSES — 20 points
+  // =========================
+
+  score += _liveSmartGlassesProb * 0.20;
+
+  // =========================
+  // 5. MOVEMENT — 10 points
+  // =========================
+
+  // Low movement = more suspicious.
+  final movementLow = _movement < 8.0;
+
+  if (movementLow) {
+    score += 10;
+  }
+
+  // =========================
+  // 6. BLE — 15 points
+  // =========================
+
+  // Temporary until live BLE scanning is connected.
+  // Simulation BLE remains separate.
+  final liveBluetoothEvidence = false;
+
+  if (liveBluetoothEvidence) {
+    score += 15;
+  }
+
+  // =========================
+  // FINAL SCORE
+  // =========================
+
+  final finalScore = score.round().clamp(0, 100);
+
+  String level;
+
+  if (finalScore >= 75) {
+    level = "HIGH RISK";
+  } else if (finalScore >= 40) {
+    level = "MEDIUM RISK";
+  } else {
+    level = "LOW RISK";
+  }
+
+  final previousLevel = _riskLevel;
+
+  setState(() {
+    _riskScore = finalScore;
+    _riskLevel = level;
+  });
+
+  // Only log when risk level changes.
+  // DO NOT write to logs on every camera frame.
+  if (previousLevel != level) {
+    _logEvent(
+      'Live Risk: $finalScore% - $level',
+    );
+  }
+
+  // HIGH RISK automatically triggers the
+  // exact same alarm used by SOS.
+  if (level == "HIGH RISK" && !_isAlarmActive) {
+    _triggerAlarmLocal(
+      "Live threat signature detected ($finalScore%)",
+    );
+  }
+}
 
   // --- Local Alarm Trigger ---
   Future<void> _triggerAlarmLocal(String cause) async {
@@ -409,7 +959,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         borderRadius: BorderRadius.circular(28),
         boxShadow: [
           BoxShadow(
-            color: const Color(0xFF332D2B).withOpacity(0.04),
+            color: const Color(0xFF332D2B).withValues(alpha: 0.04),
             blurRadius: 24,
             offset: const Offset(0, 10),
           )
@@ -452,7 +1002,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             activeTrackColor: const Color(0xFFE05A47),
             inactiveTrackColor: const Color(0xFFECE5DD),
             thumbColor: const Color(0xFFE05A47),
-            overlayColor: const Color(0xFFE05A47).withOpacity(0.12),
+            overlayColor: const Color(0xFFE05A47).withValues(alpha: 0.12),
             valueIndicatorColor: const Color(0xFFE05A47),
             trackHeight: 3.5,
           ),
@@ -480,7 +1030,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Chic Header in Pinterest style
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -647,7 +1196,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               child: Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                 decoration: BoxDecoration(
-                                  color: const Color(0xFFC94A38).withOpacity(0.9),
+                                  color: const Color(0xFFC94A38).withValues(alpha: 0.9),
                                   borderRadius: BorderRadius.circular(10),
                                 ),
                                 child: Row(
@@ -668,6 +1217,102 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                                         color: Colors.white,
                                         fontWeight: FontWeight.bold,
                                         fontSize: 10,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            Positioned(
+                              bottom: 14,
+                              left: 14,
+                              right: 14,
+                              child: Container(
+                                padding: const EdgeInsets.all(14),
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withValues(alpha: 0.72),
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _personDetected
+                                          ? "🟢 PERSON DETECTED"
+                                          : "🔴 NO PERSON",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+
+                                    const SizedBox(height: 8),
+
+                                    Text(
+                                      "Distance     ${_liveDistance.toStringAsFixed(1)} m",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                      ),
+                                    ),
+
+                                    Text(
+                                      "Orientation  ${_liveOrientation.toStringAsFixed(0)}%",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                      ),
+                                    ),
+
+                                    Text(
+                                      "Interaction  ${_interactionDetected ? "YES" : "NO"}",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                      ),
+                                    ),
+
+                                    Text(
+                                      "Duration     ${_liveDuration.toStringAsFixed(1)} s",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                      ),
+                                    ),
+
+                                    Text(
+                                      "Glasses      ${_liveSmartGlassesProb.toStringAsFixed(0)}%",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                      ),
+                                    ),
+
+                                    Text(
+                                      "Movement     ${_movement < 8 ? "LOW" : "HIGH"}",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                      ),
+                                    ),
+
+                                    const SizedBox(height: 8),
+
+                                    Text(
+                                      "RISK  $_riskScore%  •  $_riskLevel",
+                                      style: TextStyle(
+                                        color: _riskLevel == "HIGH RISK"
+                                            ? const Color(0xFFFF6B57)
+                                            : Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13,
                                       ),
                                     ),
                                   ],
@@ -961,7 +1606,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                           Switch(
                             value: _isBackgroundShieldActive,
                             onChanged: _toggleBackgroundShield,
-                            activeColor: const Color(0xFF6E8E7D),
+                            activeThumbColor: const Color(0xFF6E8E7D),
                             activeTrackColor: const Color(0xFFE8F1EC),
                           ),
                         ],
@@ -1047,7 +1692,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               shrinkWrap: true,
                               physics: const NeverScrollableScrollPhysics(),
                               itemCount: _alertsLog.length > 5 ? 5 : _alertsLog.length,
-                              separatorBuilder: (_, __) => const Divider(color: Color(0xFFFAF7F2)),
+                              separatorBuilder: (_, _) => const Divider(color: Color(0xFFFAF7F2)),
                               itemBuilder: (context, index) {
                                 final log = _alertsLog[index];
                                 return Padding(
@@ -1144,7 +1789,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               borderRadius: BorderRadius.circular(24),
                               boxShadow: [
                                 BoxShadow(
-                                  color: const Color(0xFF332D2B).withOpacity(0.04),
+                                  color: const Color(0xFF332D2B).withValues(alpha: 0.04),
                                   blurRadius: 16,
                                 )
                               ],

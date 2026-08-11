@@ -21,13 +21,31 @@ subprojects {
 
 subprojects {
     plugins.withId("com.android.library") {
-        dependencies.add("implementation", "androidx.concurrent:concurrent-futures:1.2.0")
+        dependencies.add(
+            "implementation",
+            "androidx.concurrent:concurrent-futures:1.2.0"
+        )
     }
+
     plugins.withId("com.android.application") {
-        dependencies.add("implementation", "androidx.concurrent:concurrent-futures:1.2.0")
+        dependencies.add(
+            "implementation",
+            "androidx.concurrent:concurrent-futures:1.2.0"
+        )
     }
 }
 
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
+}
+
+subprojects {
+    if (name == "tflite_flutter") {
+        tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile>().configureEach {
+            compilerOptions {
+                jvmTarget =
+                    org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11
+            }
+        }
+    }
 }
