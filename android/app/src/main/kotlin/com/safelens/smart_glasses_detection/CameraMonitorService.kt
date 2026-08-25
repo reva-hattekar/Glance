@@ -173,7 +173,7 @@ class CameraMonitorService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_FOREGROUND)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle("SafeSight Protection Active")
+            .setContentTitle("Glance Protection Active")
             .setContentText("Monitoring camera status for your safety.")
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -332,7 +332,7 @@ object AlarmEngine {
         val notification = NotificationCompat.Builder(context, CameraMonitorService.CHANNEL_ALARM)
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setContentTitle("SAFE ALERT - Camera Active")
-            .setContentText("Camera access has been detected. Tap to open SafeSight.")
+            .setContentText("Camera access has been detected. Tap to open Glance.")
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)

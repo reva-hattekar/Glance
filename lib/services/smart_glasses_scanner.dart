@@ -1,10 +1,9 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'glance_ble_coordinator.dart';
 
 /// A BLE device detected by the scanner that looks like smart glasses.
 class SmartGlassDevice {
@@ -15,6 +14,7 @@ class SmartGlassDevice {
     required this.firstSeen,
     required this.lastSeen,
     required this.isGlasses,
+    this.isBonded = false,
   });
 
   final String id;
@@ -25,6 +25,7 @@ class SmartGlassDevice {
   final DateTime? firstSeen;
   final DateTime? lastSeen;
   final bool isGlasses;
+  final bool isBonded;
 
   /// Rough distance estimate (meters) using the free-space path-loss model.
   double get estimatedDistanceMeters {
@@ -55,39 +56,70 @@ enum ScannerStatus {
 }
 
 /// Scans for nearby smart glasses over Bluetooth Low Energy.
-///
-/// Only reports devices whose advertised name matches glasses-related
-/// keywords, and silently ignores devices already paired/bonded to the phone.
 class SmartGlassesScanner {
   SmartGlassesScanner._();
   static final SmartGlassesScanner instance = SmartGlassesScanner._();
 
   /// Keywords used to decide whether a device name belongs to smart glasses.
-  /// Extend this list as new brands appear.
   static const List<String> glassKeywords = [
     'glass',
     'glasses',
+    'smart glass',
+    'smart-glasses',
+    'smartglass',
+    'smartglasses',
+    'sunglass',
+    'sunglasses',
     'eyewear',
     'eye wear',
+    'spectacle',
     'spectacles',
     'specs',
+    'shades',
+    'frame',
+    'frames',
+    'echo frame',
+    'echo frames',
+    'amazon frame',
+    'bose frame',
+    'bose frames',
+    'frames tenor',
+    'frames alto',
+    'frames soprano',
+    'frames rondo',
     'ray-ban',
     'rayban',
     'meta',
+    'stories',
+    'rw4002',
+    'rw4004',
+    'rw4006',
+    'rw4008',
     'viture',
     'rayneo',
     'nreal',
     'xreal',
-    'echo frame',
-    'echo frames',
     'solos',
+    'airgo',
     'looktech',
     'zeblaze',
     'envision',
     'focals',
-    'bose frame',
-    'smart glass',
-    'smart-glasses',
+    'even realities',
+    'even g1',
+    'g1',
+    'rokid',
+    'lucyd',
+    'anzu',
+    'huawei eyewear',
+    'gentle monster',
+    'lawk',
+    'optics',
+    'optic',
+    'goggle',
+    'goggles',
+    'lens',
+    'lenses',
   ];
 
   /// RSSI threshold (dBm) considered "too close" for a detected device.
@@ -107,7 +139,6 @@ class SmartGlassesScanner {
 
   StreamSubscription<List<ScanResult>>? _scanSub;
   bool _running = false;
-  bool _scanCycleActive = false;
   ScannerStatus _status = ScannerStatus.idle;
   String? _lastError;
   bool _showAll = false;
@@ -123,7 +154,7 @@ class SmartGlassesScanner {
     _emitDevices();
   }
 
-  /// Number of devices paired/bonded to this phone (ignored during scans).
+  /// Number of devices paired/bonded to this phone.
   int get bondedDeviceCount => _bondedIds.length;
 
   bool get isRunning => _running;
@@ -141,26 +172,62 @@ class SmartGlassesScanner {
   }
 
   void _emitDevices() {
-    // Drop devices that have not been heard from in a while.
-    final cutoff = DateTime.now().subtract(const Duration(seconds: 20));
+    // Drop devices that have not been heard from in a while (35 seconds).
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 35));
     _devices.removeWhere((_, d) => d.lastSeen == null || d.lastSeen!.isBefore(cutoff));
     if (!_devicesController.isClosed) _devicesController.add(currentDevices);
   }
 
-  bool _isGlassesLike(String name) {
-    final lower = name.toLowerCase();
-    return glassKeywords.any(lower.contains);
+  bool _isGlassesLike(String rawName) {
+    if (rawName.isEmpty) return false;
+    final clean = rawName
+        .toLowerCase()
+        .replaceAll(RegExp(r"['`’._\-\/\\]"), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    for (final kw in glassKeywords) {
+      if (clean.contains(kw)) return true;
+    }
+
+    final tokens = clean.split(' ');
+    for (final token in tokens) {
+      if (token.contains('glass') ||
+          token.contains('spectacle') ||
+          token.contains('eyewear') ||
+          token.contains('optic') ||
+          token.contains('frame') ||
+          token.contains('shade') ||
+          token.contains('lens') ||
+          token.contains('goggle') ||
+          token.contains('specs')) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  static String _bestName(ScanResult r) {
-    final adv = r.advertisementData.advName.trim();
+  static String _bestName(ScanResult r, [String? previousName]) {
+    var adv = r.advertisementData.advName.trim();
+    var plat = r.device.platformName.trim();
+
+    adv = adv.replaceAll(RegExp(r'[\x00-\x1F\x7F]'), '').trim();
+    plat = plat.replaceAll(RegExp(r'[\x00-\x1F\x7F]'), '').trim();
+
     if (adv.isNotEmpty) return adv;
-    return r.device.platformName.trim();
+    if (plat.isNotEmpty) return plat;
+    if (previousName != null &&
+        previousName.isNotEmpty &&
+        !previousName.startsWith('BLE Device')) {
+      return previousName;
+    }
+    return '';
   }
+
+  StreamSubscription<GlanceBleState>? _coordSub;
 
   /// Starts continuous scanning. Safe to call multiple times.
-  Future<void> start() async {
-    if (_running) return;
+  Future<void> start({bool userInitiated = false}) async {
     _running = true;
     _lastError = null;
     _setStatus(ScannerStatus.starting);
@@ -171,105 +238,53 @@ class SmartGlassesScanner {
       return;
     }
 
-    try {
-      final supported = await FlutterBluePlus.isSupported;
-      if (!supported) {
-        _setStatus(ScannerStatus.unsupported);
-        _running = false;
-        return;
-      }
-
-      final permissionOk = await _ensurePermissions();
-      if (!permissionOk) {
-        _setStatus(ScannerStatus.permissionDenied);
-        _running = false;
-        return;
-      }
-
-      if (!kIsWeb && Platform.isAndroid) {
-        await FlutterBluePlus.turnOn();
-      }
-
-      final state = await FlutterBluePlus.adapterState
-          .where((s) => s != BluetoothAdapterState.turningOn)
-          .first
-          .timeout(const Duration(seconds: 10));
-
-      if (state != BluetoothAdapterState.on) {
-        _setStatus(ScannerStatus.bluetoothOff);
-        _running = false;
-        return;
-      }
-
-      await _loadBondedDevices();
-
-      _devices.clear();
-
-      _scanSub = FlutterBluePlus.scanResults.listen(
-        _handleScanResults,
-        onError: (Object e) {
-          _lastError = e.toString();
+    // Listen to central coordinator state transitions
+    _coordSub?.cancel();
+    _coordSub = GlanceBleCoordinator.instance.stateStream.listen((state) {
+      switch (state) {
+        case GlanceBleState.initializing:
+          _setStatus(ScannerStatus.starting);
+          break;
+        case GlanceBleState.permissionRequired:
+          _setStatus(ScannerStatus.permissionDenied);
+          break;
+        case GlanceBleState.bluetoothOff:
+          _setStatus(ScannerStatus.bluetoothOff);
+          break;
+        case GlanceBleState.scanning:
+          _setStatus(ScannerStatus.scanning);
+          break;
+        case GlanceBleState.error:
           _setStatus(ScannerStatus.error);
-        },
-      );
+          break;
+        case GlanceBleState.uninitialized:
+          break;
+      }
+    });
 
+    await _loadBondedDevices();
+    _devices.clear();
+
+    await _scanSub?.cancel();
+    _scanSub = FlutterBluePlus.onScanResults.listen(
+      _handleScanResults,
+      onError: (Object e) {
+        _lastError = e.toString();
+        _setStatus(ScannerStatus.error);
+      },
+    );
+
+    final ok = await GlanceBleCoordinator.instance.initializeAndStartScan(userInitiated: userInitiated);
+    if (ok) {
       _setStatus(ScannerStatus.scanning);
-      _runScanLoop();
-    } catch (e) {
-      _lastError = e.toString();
-      _setStatus(ScannerStatus.error);
-      _running = false;
-    }
-  }
-
-  Future<bool> _ensurePermissions() async {
-    if (kIsWeb || !Platform.isAndroid) return true;
-
-    int sdkVersion = 0;
-    try {
-      final versionString = Platform.operatingSystemVersion;
-      final match = RegExp(r'(?:SDK|API)\s+(\d+)', caseSensitive: false).firstMatch(versionString);
-      if (match != null) {
-        sdkVersion = int.tryParse(match.group(1) ?? '') ?? 0;
-      } else {
-        final digits = RegExp(r'\d+').allMatches(versionString).map((m) => int.tryParse(m.group(0) ?? '') ?? 0).toList();
-        if (digits.isNotEmpty) {
-          for (final d in digits) {
-            if (d >= 12) {
-              sdkVersion = d;
-              break;
-            }
-          }
-          if (sdkVersion == 0) {
-            sdkVersion = digits.last;
-          }
-        }
-      }
-    } catch (_) {}
-
-    final isAndroid12OrAbove = sdkVersion >= 31 || (sdkVersion >= 12 && sdkVersion < 31);
-    _lastError = 'OS: ${Platform.operatingSystemVersion} | SDK: $sdkVersion';
-
-    if (isAndroid12OrAbove) {
-      final results = await [
-        Permission.bluetoothScan,
-        Permission.bluetoothConnect,
-      ].request();
-      final scanGranted = results[Permission.bluetoothScan]?.isGranted ?? false;
-      final connectGranted = results[Permission.bluetoothConnect]?.isGranted ?? false;
-      
-      if (!scanGranted || !connectGranted) {
-        _lastError = 'Scan: ${results[Permission.bluetoothScan]?.name}, Connect: ${results[Permission.bluetoothConnect]?.name}';
-        return false;
-      }
-      return true;
     } else {
-      final locationStatus = await Permission.location.request();
-      if (!locationStatus.isGranted) {
-        _lastError = 'Location: ${locationStatus.name}';
-        return false;
+      if (GlanceBleCoordinator.instance.state == GlanceBleState.permissionRequired) {
+        _setStatus(ScannerStatus.permissionDenied);
+      } else if (GlanceBleCoordinator.instance.state == GlanceBleState.bluetoothOff) {
+        _setStatus(ScannerStatus.bluetoothOff);
+      } else {
+        _setStatus(ScannerStatus.error);
       }
-      return true;
     }
   }
 
@@ -277,6 +292,7 @@ class SmartGlassesScanner {
     try {
       final bonded = await FlutterBluePlus.bondedDevices;
       _bondedIds = bonded.map((d) => d.remoteId.str).toSet();
+      debugPrint('[BLE BONDED] ${_bondedIds.length} bonded devices loaded');
     } catch (_) {
       _bondedIds = {};
     }
@@ -286,67 +302,59 @@ class SmartGlassesScanner {
     final now = DateTime.now();
     for (final r in results) {
       final id = r.device.remoteId.str;
+      final prev = _devices[id];
+      var name = _bestName(r, prev?.name);
 
-      // Skip devices already paired/bonded to this phone.
-      if (_bondedIds.contains(id)) continue;
+      // Exclude Glance / SafeSight ESP32 sensor from smart-glasses detection
+      final lowerName = name.toLowerCase();
+      final lowerAdv = r.advertisementData.advName.toLowerCase();
+      final lowerPlat = r.device.platformName.toLowerCase();
 
-      final name = _bestName(r);
-      if (name.isEmpty) continue;
+      if (lowerName.contains('glance-esp') ||
+          lowerName.contains('glance_esp') ||
+          lowerName.contains('safesight') ||
+          lowerAdv.contains('glance-esp') ||
+          lowerAdv.contains('safesight') ||
+          lowerPlat.contains('glance-esp') ||
+          lowerPlat.contains('safesight') ||
+          r.advertisementData.serviceUuids.any((u) => u.toString().toLowerCase().contains('4fafc201'))) {
+        continue;
+      }
 
-      final isGlasses = _isGlassesLike(name);
+      final isGlasses = name.isNotEmpty && _isGlassesLike(name);
+
+      debugPrint('[BLE DISCOVERED] id: $id | advName: "${r.advertisementData.advName}" | platName: "${r.device.platformName}" | resolved: "$name" | rssi: ${r.rssi} | isGlasses: $isGlasses');
+
       if (!_showAll && !isGlasses) continue;
 
-      final prev = _devices[id];
+      if (name.isEmpty) {
+        final shortId = id.length > 5 ? id.substring(0, 5) : id;
+        name = 'BLE Device ($shortId)';
+      }
+
+      final isBonded = _bondedIds.contains(id);
+      final displayName = (isBonded && !name.contains('(Paired)')) ? '$name (Paired)' : name;
+
       _devices[id] = SmartGlassDevice(
         id: id,
-        name: name,
+        name: displayName,
         rssi: r.rssi,
         firstSeen: prev?.firstSeen ?? now,
         lastSeen: now,
         isGlasses: isGlasses,
+        isBonded: isBonded,
       );
     }
     _emitDevices();
   }
 
-  Future<void> _runScanLoop() async {
-    while (_running) {
-      if (_scanCycleActive) return;
-      _scanCycleActive = true;
-      try {
-        await FlutterBluePlus.startScan(
-          timeout: const Duration(seconds: 8),
-          continuousUpdates: true,
-          continuousDivisor: 3,
-          removeIfGone: const Duration(seconds: 20),
-          androidUsesFineLocation: false,
-        );
-        await FlutterBluePlus.isScanning
-            .where((v) => v == false)
-            .first
-            .timeout(const Duration(seconds: 15));
-      } catch (e) {
-        _lastError = e.toString();
-        _setStatus(ScannerStatus.error);
-        if (!_running) break;
-        await Future.delayed(const Duration(seconds: 3));
-      } finally {
-        _scanCycleActive = false;
-      }
-    }
-  }
-
   /// Stops scanning and clears detected devices.
   Future<void> stop() async {
     _running = false;
-    _scanCycleActive = false;
     await _scanSub?.cancel();
     _scanSub = null;
-    if (!kIsWeb) {
-      try {
-        await FlutterBluePlus.stopScan();
-      } catch (_) {}
-    }
+    await _coordSub?.cancel();
+    _coordSub = null;
     _devices.clear();
     _emitDevices();
     _setStatus(ScannerStatus.stopped);

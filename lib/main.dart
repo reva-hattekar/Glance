@@ -12,6 +12,8 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:vibration/vibration.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'services/esp32_sensor_service.dart';
+import 'services/glance_ble_coordinator.dart';
 import 'services/smart_glasses_scanner.dart';
 import 'widgets/smart_glasses_detector_card.dart';
 
@@ -133,6 +135,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   double _liveOrientation = 0.0;
   double _liveDuration = 0.0;
   double _liveSmartGlassesProb = 0.0;
+  static const double smartGlassesClassificationThreshold = 0.30; // 30% threshold for optimal 86.96% recall and 75.47% F1
 
   DateTime? _interactionStart;
 
@@ -145,8 +148,9 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   List<String> _alertsLog = [];
 
-  Timer? _pendingAlarmPoller;
   Timer? _vibrationTimer;
+  StreamSubscription<Esp32ConnectionStatus>? _esp32StatusSub;
+  StreamSubscription<double?>? _esp32DistanceSub;
 
   // ============================================================
   // SIMULATION PARAMETERS
@@ -180,7 +184,19 @@ class _DashboardScreenState extends State<DashboardScreen>
     _initFaceDetection();
     _initGlassesModel();
 
+    // 1. Initialize central BLE coordinator and start Glance services
+    GlanceBleCoordinator.instance.initializeAndStartScan();
     _startGlassesScanner();
+    Esp32SensorService.instance.start();
+
+    _esp32StatusSub = Esp32SensorService.instance.statusStream.listen((_) {
+      if (mounted) setState(() {});
+    });
+    _esp32DistanceSub = Esp32SensorService.instance.distanceStream.listen((_) {
+      if (mounted && _isLiveMode && _personDetected) {
+        _calculateLiveRisk();
+      }
+    });
 
     _initializePermissionsAndStatus();
     _loadAlertLogs();
@@ -196,12 +212,17 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     _vibrationTimer?.cancel();
 
-    _disposeCamera();
-
-    _faceDetector?.close();
+    _esp32StatusSub?.cancel();
+    _esp32DistanceSub?.cancel();
+    Esp32SensorService.instance.stop();
 
     _glassesSub?.cancel();
     SmartGlassesScanner.instance.stop();
+    GlanceBleCoordinator.instance.stop();
+
+    _disposeCamera();
+
+    _faceDetector?.close();
 
     super.dispose();
   }
@@ -242,7 +263,7 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
 
     try {
       _glassesInterpreter = await Interpreter.fromAsset(
-        'assets/smart_glasses.tflite',
+        'assets/smart_glasses_v2.tflite',
       );
 
       final input = _glassesInterpreter!.getInputTensor(0);
@@ -336,10 +357,11 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
       _glassesInterpreter!.run(input, output);
 
       final probability = output[0][0].toDouble();
+      final isDetected = probability >= smartGlassesClassificationThreshold;
 
       debugPrint(
         "👓 GLASSES MODEL → "
-        "${(probability * 100).toStringAsFixed(1)}%",
+        "${(probability * 100).toStringAsFixed(1)}% (raw: ${probability.toStringAsFixed(3)}) [${isDetected ? 'GLASSES DETECTED' : 'CLEAR'}]",
       );
 
       if (!mounted) return;
@@ -507,12 +529,11 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
 
           _movement = 0;
           _lastFaceX = 0;
+          _riskScore = 0;
+          _riskLevel = "LOW RISK";
         });
 
         _interactionStart = null;
-
-        _calculateLiveRisk();
-
         return;
       }
 
@@ -1023,20 +1044,34 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
   // ============================================================
 
   void _calculateLiveRisk() {
-    if (!_isLiveMode ||
-        !_personDetected) {
+    if (!_isLiveMode) return;
+
+    if (!_personDetected) {
+      if (mounted && _riskScore != 0) {
+        setState(() {
+          _riskScore = 0;
+          _riskLevel = "LOW RISK";
+        });
+      }
       return;
     }
 
     double score = 0;
 
     // ----------------------------------------------------------
-    // 1. DISTANCE — 25 POINTS
+    // 1. DISTANCE — 25 POINTS (ESP32 VL53L4CD Primary, Camera Fallback)
     // ----------------------------------------------------------
 
-    if (_liveDistance <= 2.0) {
+    final sensorDist = Esp32SensorService.instance.currentDistanceMeters;
+    final isUsingSensor = sensorDist != null && Esp32SensorService.instance.isReadingFresh;
+    final effectiveDistance = isUsingSensor ? sensorDist : _liveDistance;
+    final distanceSource = isUsingSensor ? "SENSOR" : "CAMERA";
+
+    debugPrint("CV ✓ Distance input: ${effectiveDistance.toStringAsFixed(2)}m • $distanceSource");
+
+    if (effectiveDistance <= 2.0) {
       final distFactor =
-          ((2.0 - _liveDistance) / 1.5)
+          ((2.0 - effectiveDistance) / 1.5)
               .clamp(0.0, 1.0);
 
       score +=
@@ -1158,7 +1193,11 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
       '🚨 SAFETY ALARM: $cause',
     );
 
+    // 1. Phone Wake Lock & Vibration
     await WakelockPlus.enable();
+
+    // 2. Send ALARM_ON to connected ESP32 vibration motor
+    await Esp32SensorService.instance.sendAlarmOn();
 
     // Automatically open camera if necessary.
     if (!_isCameraInitialized &&
@@ -1218,6 +1257,9 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
     await WakelockPlus.disable();
     await Vibration.cancel();
 
+    // Send ALARM_OFF to ESP32 vibration motor
+    await Esp32SensorService.instance.sendAlarmOff();
+
     // Stop native alarm.
     try {
       await platform.invokeMethod(
@@ -1256,7 +1298,7 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
         boxShadow: [
           BoxShadow(
             color: const Color(0xFF5D534A)
-                .withOpacity(0.045),
+                .withValues(alpha: 0.045),
             blurRadius: 24,
             offset: const Offset(0, 10),
           ),
@@ -1326,7 +1368,7 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                 const Color(0xFFD65345),
             overlayColor:
                 const Color(0xFFD65345)
-                    .withOpacity(0.12),
+                    .withValues(alpha: 0.12),
             valueIndicatorColor:
                 const Color(0xFFD65345),
             trackHeight: 3.5,
@@ -1426,6 +1468,150 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                 0xFF7E726D,
                               ),
                             ),
+                          ),
+                          StreamBuilder<Esp32ConnectionStatus>(
+                            stream: Esp32SensorService.instance.statusStream,
+                            initialData: Esp32SensorService.instance.status,
+                            builder: (context, snapshot) {
+                              final status = snapshot.data ?? Esp32ConnectionStatus.initializing;
+                              final String label;
+                              final Color badgeBg;
+                              final Color badgeFg;
+                              final Color dotColor;
+
+                              switch (status) {
+                                case Esp32ConnectionStatus.connected:
+                                  label = "ESP32 • CONNECTED";
+                                  badgeBg = const Color(0xFFE8F1EC);
+                                  badgeFg = const Color(0xFF436B57);
+                                  dotColor = const Color(0xFF52876D);
+                                  break;
+                                case Esp32ConnectionStatus.connecting:
+                                  label = "ESP32 • CONNECTING";
+                                  badgeBg = const Color(0xFFFFF4E5);
+                                  badgeFg = const Color(0xFFB26B00);
+                                  dotColor = const Color(0xFFF59E0B);
+                                  break;
+                                case Esp32ConnectionStatus.scanning:
+                                  label = "ESP32 • SCANNING";
+                                  badgeBg = const Color(0xFFEBF3FB);
+                                  badgeFg = const Color(0xFF1E6091);
+                                  dotColor = const Color(0xFF2B82C9);
+                                  break;
+                                case Esp32ConnectionStatus.initializing:
+                                  label = "ESP32 • INITIALIZING";
+                                  badgeBg = const Color(0xFFF0EBE4);
+                                  badgeFg = const Color(0xFF7E726D);
+                                  dotColor = const Color(0xFFA89F97);
+                                  break;
+                                case Esp32ConnectionStatus.permissionRequired:
+                                  label = "ESP32 • PERMISSION REQUIRED";
+                                  badgeBg = const Color(0xFFFDE8E8);
+                                  badgeFg = const Color(0xFF9B1C1C);
+                                  dotColor = const Color(0xFFE02424);
+                                  break;
+                                case Esp32ConnectionStatus.bluetoothOff:
+                                  label = "ESP32 • BLUETOOTH OFF";
+                                  badgeBg = const Color(0xFFFDE8E8);
+                                  badgeFg = const Color(0xFF9B1C1C);
+                                  dotColor = const Color(0xFFE02424);
+                                  break;
+                                case Esp32ConnectionStatus.disconnected:
+                                  label = "ESP32 • DISCONNECTED";
+                                  badgeBg = const Color(0xFFF0EBE4);
+                                  badgeFg = const Color(0xFF8C827A);
+                                  dotColor = const Color(0xFFA89F97);
+                                  break;
+                                case Esp32ConnectionStatus.error:
+                                  label = "ESP32 • ERROR";
+                                  badgeBg = const Color(0xFFFDE8E8);
+                                  badgeFg = const Color(0xFF9B1C1C);
+                                  dotColor = const Color(0xFFE02424);
+                                  break;
+                              }
+
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  GestureDetector(
+                                    onTap: () {
+                                      if (status == Esp32ConnectionStatus.permissionRequired ||
+                                          status == Esp32ConnectionStatus.bluetoothOff ||
+                                          status == Esp32ConnectionStatus.disconnected ||
+                                          status == Esp32ConnectionStatus.error) {
+                                        GlanceBleCoordinator.instance.initializeAndStartScan(userInitiated: true);
+                                      }
+                                    },
+                                    child: Container(
+                                      margin: const EdgeInsets.only(top: 6),
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                      decoration: BoxDecoration(
+                                        color: badgeBg,
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Container(
+                                            width: 6,
+                                            height: 6,
+                                            decoration: BoxDecoration(
+                                              color: dotColor,
+                                              shape: BoxShape.circle,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 5),
+                                          Text(
+                                            label,
+                                            style: TextStyle(
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.bold,
+                                              letterSpacing: 0.5,
+                                              color: badgeFg,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  if (status != Esp32ConnectionStatus.connected)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4),
+                                      child: InkWell(
+                                        onTap: () async {
+                                          final ok = await Esp32SensorService.instance.manualConnectDebug();
+                                          if (context.mounted) {
+                                            ScaffoldMessenger.of(context).showSnackBar(
+                                              SnackBar(
+                                                content: Text(ok
+                                                    ? "Connecting to Glance ESP32..."
+                                                    : "Glance ESP32 not in scan buffer yet. Rescanning..."),
+                                                duration: const Duration(seconds: 2),
+                                              ),
+                                            );
+                                          }
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0x1F1E6091),
+                                            borderRadius: BorderRadius.circular(8),
+                                            border: Border.all(color: const Color(0x4D1E6091)),
+                                          ),
+                                          child: const Text(
+                                            "⚡ CONNECT ESP32",
+                                            style: TextStyle(
+                                              fontSize: 9,
+                                              fontWeight: FontWeight.bold,
+                                              color: Color(0xFF1E6091),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              );
+                            },
                           ),
                         ],
                       ),
@@ -1588,8 +1774,8 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                                     color:
                                                         const Color(
                                                       0xFF5D534A,
-                                                    ).withOpacity(
-                                                      0.08,
+                                                    ).withValues(
+                                                      alpha: 0.08,
                                                     ),
                                                     blurRadius:
                                                         8,
@@ -1672,8 +1858,8 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                                     color:
                                                         const Color(
                                                       0xFF5D534A,
-                                                    ).withOpacity(
-                                                      0.08,
+                                                    ).withValues(
+                                                      alpha: 0.08,
                                                     ),
                                                     blurRadius:
                                                         8,
@@ -1831,8 +2017,8 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                   color:
                                       const Color(
                                     0xFFC94A38,
-                                  ).withOpacity(
-                                    0.9,
+                                  ).withValues(
+                                    alpha: 0.9,
                                   ),
                                   borderRadius:
                                       BorderRadius
@@ -1902,8 +2088,8 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                     color:
                                         Colors
                                             .black
-                                            .withOpacity(
-                                      0.72,
+                                            .withValues(
+                                      alpha: 0.72,
                                     ),
                                     borderRadius:
                                         BorderRadius
@@ -1962,16 +2148,21 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                         height: 8,
                                       ),
 
-                                      Text(
-                                        "Distance: ${_liveDistance.toStringAsFixed(1)}m",
-                                        style:
-                                            const TextStyle(
-                                          color:
-                                              Colors
-                                                  .white70,
-                                          fontSize:
-                                              11,
-                                        ),
+                                      Builder(
+                                        builder: (context) {
+                                          final sensorDist = Esp32SensorService.instance.currentDistanceMeters;
+                                          final isUsingSensor = sensorDist != null && Esp32SensorService.instance.isReadingFresh;
+                                          final effectiveDist = isUsingSensor ? sensorDist : _liveDistance;
+                                          final distSourceLabel = isUsingSensor ? "SENSOR" : "CAMERA";
+
+                                          return Text(
+                                            "Distance: ${effectiveDist.toStringAsFixed(2)}m • $distSourceLabel",
+                                            style: const TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 11,
+                                            ),
+                                          );
+                                        },
                                       ),
 
                                       Text(
@@ -1999,16 +2190,67 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                       ),
 
                                       Text(
-                                        "Glasses probability: ${_liveSmartGlassesProb.toStringAsFixed(0)}%",
+                                        "Glasses prob: ${_liveSmartGlassesProb.toStringAsFixed(1)}% (raw: ${(_liveSmartGlassesProb / 100.0).toStringAsFixed(3)}) [${_liveSmartGlassesProb >= (smartGlassesClassificationThreshold * 100) ? '👓 DETECTED' : 'CLEAR'}]",
                                         style:
-                                            const TextStyle(
-                                          color:
-                                              Colors
-                                                  .white70,
+                                            TextStyle(
+                                          color: _liveSmartGlassesProb >= (smartGlassesClassificationThreshold * 100)
+                                              ? const Color(0xFFFF8B7A)
+                                              : Colors.white70,
+                                          fontWeight: _liveSmartGlassesProb >= (smartGlassesClassificationThreshold * 100)
+                                              ? FontWeight.bold
+                                              : FontWeight.normal,
                                           fontSize:
                                               11,
                                         ),
                                       ),
+
+                                       if (_riskLevel == "HIGH RISK") ...[
+                                         const SizedBox(height: 8),
+                                         GestureDetector(
+                                           onTap: () {
+                                             _triggerAlarmLocal(
+                                               "Manual trigger from live camera overlay ($_riskScore%)",
+                                             );
+                                           },
+                                           child: Container(
+                                             padding: const EdgeInsets.symmetric(
+                                               horizontal: 10,
+                                               vertical: 5,
+                                             ),
+                                             decoration: BoxDecoration(
+                                               color: const Color(0xFFD65345),
+                                               borderRadius: BorderRadius.circular(12),
+                                               boxShadow: const [
+                                                 BoxShadow(
+                                                   color: Colors.black26,
+                                                   blurRadius: 4,
+                                                   offset: Offset(0, 2),
+                                                 ),
+                                               ],
+                                             ),
+                                             child: const Row(
+                                               mainAxisSize: MainAxisSize.min,
+                                               children: [
+                                                 Icon(
+                                                   Icons.warning_amber_rounded,
+                                                   color: Colors.white,
+                                                   size: 14,
+                                                 ),
+                                                 SizedBox(width: 4),
+                                                 Text(
+                                                   "TRIGGER ALARM",
+                                                   style: TextStyle(
+                                                     color: Colors.white,
+                                                     fontWeight: FontWeight.bold,
+                                                     fontSize: 10,
+                                                     letterSpacing: 0.5,
+                                                   ),
+                                                 ),
+                                               ],
+                                             ),
+                                           ),
+                                         ),
+                                       ],
                                     ],
                                   ),
                                 ),
@@ -2038,8 +2280,8 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                         BoxDecoration(
                                       color: Colors
                                           .black
-                                          .withOpacity(
-                                        0.5,
+                                          .withValues(
+                                        alpha: 0.5,
                                       ),
                                       shape:
                                           BoxShape
@@ -2392,8 +2634,8 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                     color:
                                         const Color(
                                       0xFFD65345,
-                                    ).withOpacity(
-                                      0.22,
+                                    ).withValues(
+                                      alpha: 0.22,
                                     ),
                                     blurRadius:
                                         16,
@@ -2538,6 +2780,41 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                             ),
                           ),
 
+                          if (_riskLevel == "HIGH RISK") ...[
+                            const SizedBox(height: 14),
+                            SizedBox(
+                              width: double.infinity,
+                              height: 46,
+                              child: ElevatedButton.icon(
+                                onPressed: () {
+                                  _triggerAlarmLocal(
+                                    "Manually triggered from simulation risk panel",
+                                  );
+                                },
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFFD65345),
+                                  foregroundColor: Colors.white,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(24),
+                                  ),
+                                  elevation: 0,
+                                ),
+                                icon: const Icon(
+                                  Icons.warning_amber_rounded,
+                                  size: 18,
+                                ),
+                                label: const Text(
+                                  "TRIGGER EMERGENCY ALARM",
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    letterSpacing: 0.5,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+
                           const SizedBox(
                             height: 16,
                           ),
@@ -2650,7 +2927,7 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                             separatorBuilder:
                                 (
                               _,
-                              __,
+                              _,
                             ) =>
                                     const Divider(
                               color:
@@ -2930,8 +3207,8 @@ void didChangeAppLifecycleState(AppLifecycleState state) {
                                       color:
                                           const Color(
                                         0xFF6E8E7D,
-                                      ).withOpacity(
-                                        0.20,
+                                      ).withValues(
+                                        alpha: 0.20,
                                       ),
                                       blurRadius:
                                           16,

@@ -69,6 +69,7 @@ flutter:
 
   assets:
     - assets/smart_glasses.tflite
+    - assets/smart_glasses_v2.tflite
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -154,7 +154,7 @@ class _SmartGlassesDetectorCardState extends State<SmartGlassesDetectorCard> {
                     if (SmartGlassesScanner.instance.isRunning) {
                       await SmartGlassesScanner.instance.stop();
                     } else {
-                      await SmartGlassesScanner.instance.start();
+                      await SmartGlassesScanner.instance.start(userInitiated: true);
                     }
                   },
                   style: ElevatedButton.styleFrom(
