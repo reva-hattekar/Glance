@@ -1,430 +1,403 @@
 # Glance — Smart Glasses Detection & Safety
 
-> **See Smart. Stay Safe.**
+> See Smart. Stay Safe.
 
-[![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B?logo=flutter)](https://flutter.dev)
-[![TensorFlow Lite](https://img.shields.io/badge/TFLite-MobileNetV2-FF6F00?logo=tensorflow)](https://www.tensorflow.org/lite)
-[![ESP32](https://img.shields.io/badge/Hardware-ESP32-E7352C?logo=espressif)](https://www.espressif.com)
-[![Sensors](https://img.shields.io/badge/ToF-VL53L4CD-4B0082)](https://www.st.com)
-[![BLE](https://img.shields.io/badge/Protocol-BLE_GATT-00758F?logo=bluetooth)](https://www.bluetooth.com)
+Glance is a prototype safety application that combines camera-based smart-glasses detection with Bluetooth scanning, distance sensing, and contextual information. Instead of relying on a single visual prediction, it combines several available inputs to estimate whether an interaction deserves attention.
 
-**Glance** is a multi-modal personal safety and situational awareness system designed to detect potential smart-glasses-based privacy and safety risks. By combining on-device computer vision, physical Bluetooth Low Energy (BLE) scanning, hardware laser distance sensing (Time-of-Flight), and a context-aware risk engine, Glance evaluates encounters holistically rather than relying on a single fallible sensor or classifier.
+The app connects over Bluetooth Low Energy (BLE) to an ESP32-based wearable hardware node equipped with a VL53L4CD Time-of-Flight (ToF) distance sensor and a small vibration motor for physical alerts.
 
 ---
 
-## 1. Problem Statement
+## 1. What Problem Does Glance Solve?
 
-With the rapid adoption of wearable smart glasses and covert recording devices, identifying whether someone is actively recording or observing you in close proximity has become challenging:
+Smart glasses are becoming more common and look very similar to standard prescription eyewear or sunglasses. From a phone camera alone, distinguishing smart glasses from regular glasses is difficult.
 
-* **Visual Camouflage**: Modern smart glasses resemble conventional eyewear, making casual visual detection difficult and error-prone.
-* **Camera Classifier Limitations**: Vision-only AI models can generate false positives (e.g., misclassifying stylish regular frames) or false negatives (due to lighting, distance, or viewing angles).
-* **Missing Physical Evidence**: Visual appearance alone does not confirm whether an active wireless device is present nearby.
-* **Lack of Context**: Fleeting or distant glances do not pose the same risk as close-proximity, sustained, direct observations.
+A single visual model prediction can easily make mistakes because of:
+* Poor or uneven lighting
+* Viewing angles and head tilt
+* Distance from the camera
+* Thick designer frames that look like smart glasses
+* Camera resolution and motion blur
 
-Glance solves this by implementing **multi-modal sensor fusion**, validating visual indicators against physical BLE broadcasts and accurate millimeter laser distance measurements.
-
----
-
-## 2. Solution Overview
-
-Glance links an Android smartphone application with a wearable ESP32 sensor node to form a unified detection and alerting pipeline:
-
-```
-Camera Stream
-  │
-  ├──► Google ML Kit ──────► Face & Person Detection
-  │                          Orientation (Euler Y/Z)
-  │                          Interaction Duration
-  │
-  └──► Custom TFLite ──────► Smart-Glasses Visual Probability
-       (MobileNetV2)
-
-ESP32 Node
-  │
-  └──► VL53L4CD Sensor ────► Continuous Laser Distance (ToF)
-       (I2C: SDA=21, SCL=22)   (BLE GATT Notifications)
-                               │
-                               ▼
-Smartphone BLE ────────────► BLE Smart Device / Beacon Evidence
-Coordinator                  (RSSI Signal Tracking)
-
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │   RISK ENGINE   │
-                    └────────┬────────┘
-                             │
-            ┌────────────────┼────────────────┐
-            ▼                ▼                ▼
-        LOW RISK        MEDIUM RISK       HIGH RISK (≥ 75%)
-        (< 40%)          (40 - 74%)           │
-                                              ▼
-                                    Phone Audio & Vibration
-                                              +
-                                    ESP32 Vibration Motor
-                                    (Bidirectional Sync)
-```
-
-> **Distance Priority**: The physical VL53L4CD Time-of-Flight sensor is the **primary** distance source. If the ESP32 is offline or out of range, Glance automatically switches to camera face-ratio distance estimation as a seamless **fallback**.
+Because smart glasses often broadcast Bluetooth signals and encounters become more relevant at close range, Glance combines the camera model with Bluetooth device detection, physical distance measurements, and interaction context instead of treating the visual classifier as the final answer.
 
 ---
 
-## 3. System Architecture
+## 2. How Glance Works
+
+Glance processes multiple inputs in parallel to calculate a single situational risk score:
 
 ```mermaid
-graph TB
-    subgraph "Smartphone (Glance App)"
-        UI["Flutter UI Layer (Dashboard & Live Overlay)"]
-        CV["Camera & ML Kit Pipeline"]
-        TFLite["TFLite Classifier (MobileNetV2 224x224)"]
-        BLE_Coord["Glance BLE Coordinator"]
-        RiskEngine["Context-Aware Multi-Factor Risk Engine"]
-        AlarmMgr["Alarm & Audio/Haptic Manager"]
-    end
+graph TD
+    A[Phone Camera] -->|Face Crop| B[MobileNetV2 TFLite Model]
+    A -->|Face Tracking| C[Orientation & Duration]
+    A -->|Face Ratio| D[Camera Distance Fallback]
 
-    subgraph "ESP32 Wearable Node"
-        GATT["BLE GATT Server (Glance-ESP32)"]
-        TOF["VL53L4CD Laser ToF Sensor (I2C)"]
-        Motor["2N2222 Driver & Vibration Motor (GPIO 4)"]
-    end
+    E[ESP32 Node] -->|VL53L4CD I2C| F[Laser ToF Distance]
+    F -->|BLE Notifications| G[Glance App]
 
-    CV -->|"Face Crop & Bounding Box"| TFLite
-    TFLite -->|"Visual Prob (0-100%)"| RiskEngine
-    CV -->|"Orientation & Duration"| RiskEngine
-    CV -->|"Camera Fallback Distance"| RiskEngine
+    H[Phone Bluetooth] -->|BLE Scan| I[Nearby Device Evidence]
 
-    BLE_Coord -->|"Smart Glasses BLE Beacons"| RiskEngine
-    BLE_Coord <==|"GATT Connection / Reconnect"|==> GATT
+    B --> J[Risk Engine]
+    C --> J
+    F -.->|Primary Distance| J
+    D -.->|Fallback Distance| J
+    I --> J
 
-    TOF -->|"Distance Packets (10Hz)"| GATT
-    GATT -->|"Primary Distance Stream"| BLE_Coord
-    BLE_Coord -->|"Physical Distance (m)"| RiskEngine
+    J -->|Score 0-100| K{Risk Level}
+    K -->|0-39| L[Low Risk]
+    K -->|40-74| M[Medium Risk]
+    K -->|75+| N[High Risk Alert]
 
-    RiskEngine -->|"Risk Score (0-100%)"| UI
-    RiskEngine -->|"High Risk Trigger (≥ 75%)"| AlarmMgr
-
-    AlarmMgr -->|"Local Audio & Vibration"| UI
-    AlarmMgr -->|"Write ALARM_ON / ALARM_OFF"| BLE_Coord
-    BLE_Coord -->|"Command Char (1c95d5e3...)"| GATT
-    GATT -->|"Pulse Pattern (300ms ON / 300ms OFF)"| Motor
+    N --> O[Phone Siren & Vibration]
+    N -->|ALARM_ON| P[ESP32 Motor Vibration]
 ```
 
----
-
-## 4. Key Features
-
-* **Real-Time Camera Monitoring**: Continuous 30 FPS processing using Google ML Kit and camera streams.
-* **On-Device Vision AI**: Custom MobileNetV2 classifier running locally via TensorFlow Lite without cloud dependencies.
-* **Hardware Time-of-Flight Ranging**: Millimeter-precision distance sensing up to 4.0 meters via STM32 VL53L4CD.
-* **Seamless Sensor Fallback**: Automatic failover to camera distance estimation when the physical sensor is disconnected.
-* **Bluetooth Smart Glasses Detection**: Background BLE scanning tracking signal strength (RSSI) from wearable device broadcasts.
-* **Contextual Risk Engine**: Multi-factor scoring incorporating distance, gaze orientation, interaction duration, visual probability, facial movement, and RF proximity.
-* **Bidirectional Alarm Synchronization**: Synchronous smartphone siren/vibration and ESP32 haptic vibration motor feedback.
-* **Simulation & Testing Mode**: Isolated parameter sandbox for testing risk thresholds with explicit calculation gating.
-* **Modern Adaptive Launcher Branding**: Custom dark-navy and neon-cyan optical aperture iconography across all Android densities.
-* **Zero-Cloud Privacy**: 100% on-device processing for video frames, sensor streams, and telemetry.
+1. **Vision**: The phone camera runs face detection via Google ML Kit, crops the face region, and passes it to an on-device TensorFlow Lite model.
+2. **Distance**: The ESP32 reads physical distance from the VL53L4CD sensor and sends it to the phone over BLE at ~10 Hz. If the ESP32 is not connected, the app estimates distance from the camera face size as a fallback.
+3. **Bluetooth**: The phone scans for nearby BLE devices and beacons, using signal strength (RSSI) to estimate proximity.
+4. **Context**: The app tracks how long the person has been facing the user and whether their head is turned directly toward the camera.
+5. **Risk Engine**: All signals are weighted into a risk score from 0 to 100. If the score reaches 75 or higher (High Risk), both the phone and the ESP32 trigger synchronized alarms.
 
 ---
 
-## 5. AI / Machine Learning Model
+## 3. Main Features
 
-The visual detection pipeline uses a lightweight convolutional neural network optimized for low-latency mobile inference.
+* **Real-time camera monitoring**: Live camera preview with bounding box and telemetry overlay.
+* **Person & face detection**: Tracks head orientation (yaw/pitch) and interaction duration.
+* **Smart-glasses visual classification**: On-device MobileNetV2 classifier running in TensorFlow Lite.
+* **BLE device scanning**: Background scanning for nearby smart devices and beacons with RSSI tracking.
+* **ESP32 hardware integration**: Auto-connects over BLE to stream distance and receive alert commands.
+* **VL53L4CD distance measurement**: Millimeter-level Time-of-Flight laser ranging up to ~4 meters.
+* **Camera distance fallback**: Automatically estimates distance from face proportions if the hardware sensor is unavailable.
+* **Multi-factor risk calculation**: Combines distance, duration, orientation, visual probability, movement, and BLE signals.
+* **Phone vibration and audio alert**: Audible siren and haptic alert when High Risk is triggered.
+* **ESP32 vibration feedback**: Physical haptic pulsing on the wearable node synchronized with the phone.
+* **Automatic BLE reconnection**: Reconnects to the ESP32 if the signal drops.
+* **Simulation mode**: Interactive sandbox to test risk score calculation with manual inputs.
+* **Safety event logs**: In-app timeline of risk state changes and alarms.
 
-* **Format**: TensorFlow Lite (`assets/smart_glasses_v2.tflite`)
-* **Model Size**: **2.58 MB**
-* **Input Dimensions**: `224 × 224 × 3` (RGB, Normalized: $\frac{\text{pixel}}{127.5} - 1.0$)
-* **Base Architecture**: MobileNetV2 (ImageNet pretrained feature extractor)
-* **Classification Head**: `GlobalAveragePooling2D` $\rightarrow$ `Dropout(0.35)` $\rightarrow$ `Dense(64, ReLU)` $\rightarrow$ `Dropout(0.25)` $\rightarrow$ `Dense(1, Sigmoid)`
-* **Visual Decision Threshold**: **0.30** ($30\%$)
+---
+
+## 4. AI Model
+
+The visual classifier runs locally on the phone using TensorFlow Lite:
+
+* **Base architecture**: MobileNetV2 (pretrained on ImageNet)
+* **Custom head**: GlobalAveragePooling2D → Dropout(0.35) → Dense(64, ReLU) → Dropout(0.25) → Dense(1, Sigmoid)
+* **Input size**: 224 × 224 × 3 (RGB, normalized to `[-1.0, 1.0]`)
+* **Model file**: `assets/smart_glasses_v2.tflite` (2.58 MB)
+* **Inference**: On-device (runs in ~25–40 ms on modern Android devices)
+* **Visual classification threshold**: **30% (0.30)**
 
 $$\begin{aligned}
-\text{Model Probability} < 0.30 &\longrightarrow \textbf{CLEAR / NOT DETECTED} \\
-\text{Model Probability} \ge 0.30 &\longrightarrow \textbf{GLASSES DETECTED}
+\text{Model Probability} < 0.30 &\longrightarrow \text{CLEAR} \\
+\text{Model Probability} \ge 0.30 &\longrightarrow \text{GLASSES DETECTED}
 \end{aligned}$$
 
-> **Important Distinction**: The vision classification threshold ($0.30$) is **not** the alarm trigger threshold. Visual detection contributes at most $20$ points to the risk engine. An emergency alarm requires a cumulative risk score of **$\ge 75\%$**.
+### Why a 30% Threshold?
+
+The visual classification threshold is intentionally set to 30% to give high recall (catching more potential smart-glasses cases). Because a positive visual prediction only adds up to 20 points to the risk engine, a 30% visual detection **cannot** trigger an emergency alarm on its own. The overall system High Risk alert requires a combined score of **75% or higher**, which needs corroborating evidence such as close distance, direct orientation, and sustained interaction.
 
 ---
 
-## 6. Model Evaluation
+## 5. Model Evaluation
 
-Evaluated directly on the project's held-out test partition ($N = 61$ images) using the deployed `smart_glasses_v2.tflite` model:
+The model was evaluated on a held-out test dataset of images collected and organized for this project:
 
-### Dataset Composition
-* **Total Valid Samples**: 403 images
-  * **Positive Class (Smart Glasses)**: 153 images
-  * **Negative Class (Regular / No Glasses)**: 250 images
-    * *With Regular Eyeglasses*: 150 images
-    * *Without Glasses*: 100 images
-* **Split Strategy**: Stratified 70% Train (281), 15% Validation (61), 15% Held-Out Test (61)
+### Dataset
 
-### Held-Out Test Performance ($\text{Threshold} = 0.30$)
+* **Total images**: 403
+  * **Positive (Smart Glasses)**: 153
+  * **Negative (Regular Glasses / No Glasses)**: 250
+    * Regular glasses: 150
+    * Without glasses: 100
+* **Split**: 70% Train (281), 15% Validation (61), 15% Held-Out Test (61)
 
-| Metric | Measured Result |
+### Test Results (Threshold = 0.30)
+
+| Metric | Result |
 | :--- | :---: |
-| **Accuracy** | **78.69%** |
-| **Precision** | **66.67%** |
-| **Recall** | **86.96%** |
-| **F1 Score** | **75.47%** |
-| **ROC-AUC (Threshold Independent)** | **86.96%** |
+| **Accuracy** | 78.69% |
+| **Precision** | 66.67% |
+| **Recall** | 86.96% |
+| **F1 Score** | 75.47% |
+| **ROC-AUC** | 86.96% |
 
 ### Confusion Matrix ($N = 61$)
 
-| | Predicted Negative (Clear) | Predicted Positive (Detected) |
+| | Predicted Clear | Predicted Glasses |
 | :--- | :---: | :---: |
-| **Actual Negative (Regular / None)** | **$\text{TN} = 28$** | $\text{FP} = 10$ |
-| **Actual Positive (Smart Glasses)** | $\text{FN} = 3$ | **$\text{TP} = 20$** |
+| **Actual Regular / No Glasses (38)** | **TN = 28** | FP = 10 |
+| **Actual Smart Glasses (23)** | FN = 3 | **TP = 20** |
 
-* **High Safety Recall**: **20 out of 23** smart-glasses test cases correctly detected (missing only 3 edge cases).
-* **Engineering Rationale**: In personal safety applications, minimizing False Negatives ($\text{FN}$) is prioritized. False visual predictions are mitigated downstream by requiring multi-modal corroboration.
+20 of the 23 smart-glasses samples in the held-out test set were correctly detected. The model is intended as one input to the overall system rather than a standalone decision-maker. The relatively high recall at the selected threshold is useful because possible detections can be verified against distance, BLE, and other contextual signals.
 
 ---
 
-## 7. Multi-Modal Risk Engine
+## 6. Multi-Factor Risk Engine
 
-Glance calculates situational risk dynamically ($0 - 100\%$) using 6 independent indicators:
+The risk engine scores an interaction from 0 to 100 based on 6 factors:
 
-| Factor | Weight | Evaluation Criteria |
+| Factor | Max Points | How It Is Evaluated |
 | :--- | :---: | :--- |
-| **1. Proximity / Distance** | **25 pts** | $\le 2.0\text{ m}$ ($10\text{ pts}$ base $+ 15 \times \frac{2.0 - \text{dist}}{1.5}$). Primary: ESP32 ToF, Fallback: Camera. |
-| **2. Interaction Duration** | **15 pts** | Sustained visual engagement $\ge 5.0\text{ seconds}$. |
-| **3. Face / Head Orientation** | **15 pts** | Direct gaze alignment with camera ($\text{orientation} \times 0.15$). |
-| **4. Visual Glasses Classifier** | **20 pts** | Continuous MobileNetV2 output ($\text{probability} \times 0.20$). |
-| **5. Relative Movement** | **10 pts** | Low relative facial translation ($< 8.0\text{ px}$) indicating fixed tracking. |
-| **6. RF / BLE Device Signal** | **15 pts** | Nearby smart glasses signal strength ($(\text{RSSI} + 90) / 50 \times 15$, clamped $2.0 - 15.0\text{ pts}$). |
+| **1. Distance** | **25 pts** | Active below 2.0 m: `10 + 15 * ((2.0 - dist) / 1.5)`. Uses ESP32 ToF primary, camera fallback. |
+| **2. Interaction Duration** | **15 pts** | Awarded when continuous interaction reaches 5.0 seconds or longer. |
+| **3. Face Orientation** | **15 pts** | Based on Euler Y/Z angles facing directly toward the camera (`orientation * 0.15`). |
+| **4. Visual Model** | **20 pts** | Proportional to raw model probability (`probability * 0.20`). |
+| **5. Movement** | **10 pts** | Awarded when facial movement is low (< 8 px), indicating focused observation. |
+| **6. BLE Signal** | **15 pts** | Based on RSSI of nearby detected devices: `clamp((RSSI + 90) / 50 * 15, 2.0, 15.0)`. |
 
-### Risk Tiers
-* **LOW RISK ($0 - 39\%$)**: Normal ambient activity.
-* **MEDIUM RISK ($40 - 74\%$)**: Elevated proximity or visual similarity without full corroboration.
-* **HIGH RISK ($\ge 75\%$)**: Simultaneous close proximity, directed orientation, sustained duration, and RF/visual detection $\longrightarrow$ **Triggers Emergency Alarm**.
+### Risk Categories
 
----
-
-## 8. Hardware & Wiring
-
-The Glance hardware node uses an ESP32 microcontroller with a Time-of-Flight laser ranging sensor and a transistor-driven vibration motor.
-
-```
-       ESP32 DevKit
-   ┌──────────────────┐
-   │                  │
-   │          GPIO 21 ├──────────────► VL53L4CD SDA
-   │          GPIO 22 ├──────────────► VL53L4CD SCL
-   │             3.3V ├──────────────► VL53L4CD VIN
-   │              GND ├──────┬───────► VL53L4CD GND
-   │                  │      │
-   │           GPIO 4 ├───[ 1kΩ ]───► 2N2222 Base
-   │                  │      │
-   └──────────────────┘      │
-                             │
-     VCC (3.3V/5V) ──────────┼────────► Motor (+)
-                             │             │
-                             │        [ 1N4007 Diode ] (Flyback)
-                             │             │
-                             ▼             ▼
-                      2N2222 Emitter  Motor (-) ──► 2N2222 Collector
-                             │
-                            GND (Shared)
-```
-
-### Components List
-* **Microcontroller**: ESP32 DevKit (ESP32-WROOM-32)
-* **Ranging Sensor**: STMicroelectronics VL53L4CD Time-of-Flight Module
-* **Haptic Actuator**: Coreless Micro Vibration Motor (3V)
-* **Driver Transistor**: 2N2222 NPN BJT
-* **Flyback Protection**: 1N4001 / 1N4007 Diode (parallel across motor terminals)
-* **Base Resistor**: $1\text{ k}\Omega$ (ESP32 GPIO 4 $\rightarrow$ 2N2222 Base)
-* **Power**: USB 5V or 3.7V LiPo with 3.3V LDO regulator
+* **LOW RISK (0–39%)**: Normal ambient situation.
+* **MEDIUM RISK (40–74%)**: Some indicators present (e.g., visual similarity or moderate distance), but insufficient combined evidence.
+* **HIGH RISK (75–100%)**: Multiple strong indicators occur simultaneously (e.g., very close distance + direct orientation + visual detection + BLE signal). **Triggers the alarm system.**
 
 ---
 
-## 9. ESP32 Firmware & BLE Protocol
+## 7. Hardware
 
-The firmware creates a BLE GATT Server advertising as **`Glance-ESP32`**.
+The hardware node is built with standard prototype components:
 
-### GATT UUID Configuration
+* **ESP32 Dev Module** (ESP32-WROOM-32)
+* **STMicroelectronics VL53L4CD** Time-of-Flight sensor (I2C)
+* **3V Micro Vibration Motor**
+* **2N2222 NPN Transistor** (motor driver)
+* **1N4007 Diode** (flyback protection across motor terminals)
+* **1 kΩ Resistor** (between ESP32 GPIO 4 and transistor base)
 
-| Component | UUID | Properties | Description |
+### Pin Configuration
+
+| Component Pin | ESP32 Pin | Function |
+| :--- | :--- | :--- |
+| **VL53L4CD SDA** | GPIO 21 | I2C Data (400 kHz Fast Mode) |
+| **VL53L4CD SCL** | GPIO 22 | I2C Clock |
+| **VL53L4CD VIN** | 3.3V | Power |
+| **VL53L4CD GND** | GND | Ground |
+| **Motor Driver Base** | GPIO 4 | Digital output for motor control |
+
+---
+
+## 8. ESP32 + BLE
+
+The ESP32 runs a BLE GATT server that advertises as `Glance-ESP32`.
+
+### GATT Configuration
+
+| Service / Characteristic | UUID | Properties | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Primary Service** | `4fafc201-1fb5-459e-8fcc-c5c9c331914b` | — | Glance Custom Service |
-| **Distance Characteristic** | `beb5483e-36e1-4688-b7f5-ea07361b26a8` | Read, Notify | Streams 3-byte distance packets at ~10 Hz |
-| **Command Characteristic** | `1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e` | Write, WriteNR | Receives `ALARM_ON`, `ALARM_OFF`, `MOTOR_TEST` |
+| **Glance Service** | `4fafc201-1fb5-459e-8fcc-c5c9c331914b` | — | Main GATT service |
+| **Distance Characteristic** | `beb5483e-36e1-4688-b7f5-ea07361b26a8` | Read, Notify | Streams 3-byte distance packets (~10 Hz) |
+| **Command Characteristic** | `1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e` | Write, WriteNR | Receives control commands from phone |
 
-### Packet Specifications
-* **Distance Packet (ESP32 $\rightarrow$ Phone)**:
-  * `Byte 0`: Status (`0x00` = Valid, `0x01` = Invalid/Out of range)
-  * `Byte 1`: Distance MSB ($\text{mm} \gg 8$)
-  * `Byte 2`: Distance LSB ($\text{mm} \ \& \ \text{0xFF}$)
-* **Command Strings (Phone $\rightarrow$ ESP32)**:
-  * `ALARM_ON`: Starts non-blocking 300 ms ON / 300 ms OFF repeating vibration pulse pattern.
-  * `ALARM_OFF`: Immediately clears GPIO 4 to LOW and disarms motor.
-  * `MOTOR_TEST`: Pulses motor for 2.0 seconds for diagnostic verification.
+### Control Commands
+
+* **`ALARM_ON`**: Starts a non-blocking 300 ms ON / 300 ms OFF vibration pattern on GPIO 4.
+* **`ALARM_OFF`**: Immediately stops the vibration motor and resets GPIO 4 to LOW.
+* **`MOTOR_TEST`**: Pulses the motor for 2 seconds to verify wiring.
+
+---
+
+## 9. Distance Measurement
+
+Glance supports two distance sources:
+
+1. **Primary (VL53L4CD ToF Sensor)**: Directly measures physical distance using laser Time-of-Flight. It provides millimeter-accurate readings up to ~4 meters and is unaffected by camera zoom or facial crop angles.
+2. **Fallback (Camera Estimation)**: If the ESP32 is not connected or returns an invalid reading, the app estimates distance based on the detected face bounding-box ratio relative to the frame.
+
+The camera overlay explicitly shows which distance source is currently active:
+* `Distance 1.25m • SENSOR` (when ESP32 is streaming valid data)
+* `Distance 1.40m • CAMERA` (when running on camera fallback)
 
 ---
 
 ## 10. Simulation Mode
 
-Glance includes an interactive **Simulation Sandbox** allowing users and evaluators to test risk engine behavior without physical hardware triggers:
+Glance includes a built-in simulation screen to test the risk engine logic under different scenarios:
 
-* **Interactive Controls**: Distance slider ($0.5 - 5.0\text{ m}$), Smart-Glasses visual slider ($0 - 100\%$), Interaction duration ($0 - 30\text{ s}$), Orientation ($0 - 100\%$), Bluetooth toggle (YES/NO), Movement toggle (LOW/HIGH).
-* **Isolated Trigger Gating**: Adjusting inputs updates the simulated parameters **without** computing risk or firing alarms.
-* **Explicit Execution**: Risk calculation and alarm conditions are evaluated **only** when the user taps **`CALCULATE`**.
+* **Controls**: Sliders for Distance ($0.5–5.0\text{ m}$), Smart-Glasses Probability ($0–100\%$), Duration ($0–30\text{ s}$), Orientation ($0–100\%$), and toggles for Bluetooth evidence and Low Movement.
+* **Gated Evaluation**: Changing sliders updates the displayed values only. Risk is calculated and alarms can fire **only when the user taps `CALCULATE`**.
 
 ---
 
-## 11. Project Structure
+## 11. App Interface
+
+The main app interface includes:
+
+* **Live Monitoring Status**: Active sensor indicators (Camera, ML Model, BLE Scanner, ESP32 connection).
+* **Camera View & HUD**: Real-time video preview with face bounding box, orientation angle, interaction duration timer, distance readout, and raw model probability.
+* **Smart Glasses Radar Card**: Shows nearby scanned Bluetooth devices with RSSI and filter toggles.
+* **Risk Score Card**: Visual gauge showing the calculated risk percentage and category (LOW, MEDIUM, HIGH).
+* **Safety Event Log**: Scrollable history of state transitions, sensor connections, and triggered alerts.
+* **Simulation Sandbox**: Manual input panel for testing.
+
+---
+
+## 12. Project Architecture
+
+```
+Flutter Application (Android)
+├── Camera & ML Pipeline (ML Kit + TFLite)
+├── BLE Coordinator (Permissions + Scanning)
+├── ESP32 Sensor Service (GATT Distance & Commands)
+├── Multi-Factor Risk Engine
+└── Dashboard UI & Event Logging
+       │
+       │ Bluetooth Low Energy (GATT)
+       ▼
+ESP32 Hardware Node
+├── VL53L4CD Laser ToF Sensor (I2C)
+├── BLE GATT Server (Glance-ESP32)
+└── 2N2222 Vibration Motor Driver (GPIO 4)
+```
+
+---
+
+## 13. Project Structure
 
 ```
 Glance/
-├── android/                        # Android platform project & manifests
+├── android/                        # Android project configuration & manifests
 │   └── app/src/main/
-│       ├── AndroidManifest.xml     # Permissions, foreground services, Glance label
-│       ├── kotlin/.../             # Native camera monitor & background service
-│       └── res/                    # Adaptive icons, mipmap densities, colors.xml
-├── assets/                         # Runtime mobile assets
-│   ├── glance_logo.png             # Master Glance brand logo
-│   └── smart_glasses_v2.tflite     # Quantized on-device ML model (2.58 MB)
-├── firmware/                       # Microcontroller source code
+│       ├── AndroidManifest.xml     # BLE, Camera, Foreground permissions
+│       ├── kotlin/.../             # Native background service hooks
+│       └── res/                    # Adaptive launcher icons & colors
+├── assets/
+│   ├── glance_logo.png             # Official Glance logo asset
+│   └── smart_glasses_v2.tflite     # MobileNetV2 model file (2.58 MB)
+├── firmware/
 │   └── safesight_esp32/
-│       └── safesight_esp32.ino     # ESP32 firmware (VL53L4CD, BLE GATT, motor)
-├── lib/                            # Flutter / Dart application codebase
+│       └── safesight_esp32.ino     # ESP32 Arduino firmware
+├── lib/
 │   ├── services/
-│   │   ├── esp32_sensor_service.dart    # BLE GATT subscriber & alarm manager
-│   │   ├── glance_ble_coordinator.dart  # Central BLE permissions & continuous scan
-│   │   └── smart_glasses_scanner.dart   # Wearable beacon RF signal processor
+│   │   ├── esp32_sensor_service.dart    # ESP32 BLE GATT connection & distance parser
+│   │   ├── glance_ble_coordinator.dart  # Centralized BLE scanner & permissions
+│   │   └── smart_glasses_scanner.dart   # Nearby BLE device scanner & RSSI tracker
 │   ├── widgets/
-│   │   └── smart_glasses_detector_card.dart # Live RF device list & radar UI
-│   └── main.dart                   # Core UI, camera pipeline, ML Kit, risk engine
-├── model_training/                 # ML training scripts & artifacts
-├── pubspec.yaml                    # Flutter dependencies & asset bindings
+│   │   └── smart_glasses_detector_card.dart # Radar UI & device list widget
+│   └── main.dart                   # Main UI, camera loop, ML Kit, and risk engine
+├── model_training/                 # Python scripts used during model training
+├── pubspec.yaml                    # Flutter dependencies
 └── README.md                       # Project documentation
 ```
 
 ---
 
-## 12. Technology Stack
+## 14. Technology Stack
 
-| Domain | Technology / Library | Purpose |
+| Component | Technology | Purpose |
 | :--- | :--- | :--- |
-| **Mobile Framework** | Flutter 3.x / Dart SDK ^3.12 | Cross-platform application UI and state management |
-| **On-Device Vision** | TensorFlow Lite (`tflite_flutter`) | Low-latency smart-glasses binary classification |
-| **Vision Utilities** | Google ML Kit (`google_mlkit_face_detection`) | Face boundary extraction, head Euler angles |
-| **Bluetooth LE** | `flutter_blue_plus` | Continuous background BLE scanning & GATT client |
-| **Camera Pipeline** | `camera` plugin | NV21 camera frame streaming & YUV image processing |
-| **Embedded Hardware** | ESP32 (Tensilica Xtensa Dual-Core) | Hardware edge processing node |
-| **ToF Driver** | `STM32duino VL53L4CD` (STMicroelectronics) | Laser Time-of-Flight ranging library |
-| **Firmware SDK** | Arduino Core for ESP32 | ESP32 BLE GATT server & GPIO control |
+| **Mobile App** | Flutter / Dart (SDK ^3.12) | Cross-platform UI and state management |
+| **Vision Model** | TensorFlow Lite (`tflite_flutter`) | On-device smart-glasses inference |
+| **Face Tracking** | Google ML Kit (`google_mlkit_face_detection`) | Face bounding boxes & head orientation angles |
+| **Bluetooth** | `flutter_blue_plus` | BLE device scanning and ESP32 GATT communication |
+| **Camera** | `camera` | Live frame capture and image streaming |
+| **Hardware** | ESP32 Dev Module | Microcontroller for sensor node |
+| **ToF Sensor** | STMicroelectronics VL53L4CD | Laser Time-of-Flight distance measurement |
+| **Firmware SDK** | Arduino Core for ESP32 | ESP32 BLE server and sensor driver |
 
 ---
 
-## 13. Setup & Installation
+## 15. Setup & Running
 
 ### Prerequisites
-* **Flutter SDK**: `^3.12.2` or later
-* **Android Studio / Android SDK**: API Level 34+ (compileSdk 34, minSdk 21)
-* **Arduino IDE**: `2.x+` with ESP32 board package installed
-* **Physical Devices**:
-  * Android smartphone with BLE support (Android 10+)
-  * ESP32 Development Board + VL53L4CD sensor module
 
----
+* Flutter SDK (`^3.12.2` or later)
+* Android Studio with Android SDK (API 21+)
+* Arduino IDE 2.x with ESP32 board support
+* An Android phone with Bluetooth enabled
+* ESP32 board + VL53L4CD sensor module
 
-### Step 1: Clone Repository & Install Dependencies
+### 1. Flash the ESP32
 
-```bash
-git clone https://github.com/reva-hattekar/Glance.git
-cd Glance
-flutter pub get
-```
-
----
-
-### Step 2: Flash ESP32 Firmware
-
-1. Connect the ESP32 to your computer via USB.
-2. Open Arduino IDE and navigate to `firmware/safesight_esp32/safesight_esp32.ino`.
-3. In **Library Manager**, install:
-   * **`STM32duino VL53L4CD`** by *STMicroelectronics*
-4. In **Tools > Board**, select **`ESP32 Dev Module`**.
-5. Select the correct **COM Port**.
-6. Wire the VL53L4CD sensor:
-   * `VIN` $\rightarrow$ `3.3V`
-   * `GND` $\rightarrow$ `GND`
-   * `SDA` $\rightarrow$ `GPIO 21`
-   * `SCL` $\rightarrow$ `GPIO 22`
-7. Wire the vibration motor transistor circuit to **`GPIO 4`**.
-8. Click **Upload**.
-9. Open **Serial Monitor** (`115200 baud`) to verify sensor initialization:
+1. Open `firmware/safesight_esp32/safesight_esp32.ino` in Arduino IDE.
+2. In the Library Manager, install **`STM32duino VL53L4CD`** by STMicroelectronics.
+3. Select board **ESP32 Dev Module** and choose your COM port.
+4. Wire the hardware:
+   * `VL53L4CD SDA` → `GPIO 21`
+   * `VL53L4CD SCL` → `GPIO 22`
+   * `VL53L4CD VIN` → `3.3V`
+   * `VL53L4CD GND` → `GND`
+   * `Motor Driver Base` → `GPIO 4` (via 1 kΩ resistor)
+5. Upload the code and open Serial Monitor at `115200 baud` to verify:
 
 ```text
-==========================================
-         GLANCE ESP32 SENSOR NODE         
-==========================================
 [GLANCE ESP32] Starting...
 [GLANCE MOTOR] Motor pin GPIO 4 configured (LOW)
 [GLANCE ESP32] Scanning I2C bus (SDA=21, SCL=22)...
-[I2C] Found device at address 0x29 (VL53L4CD default 7-bit address)
+[I2C] Found device at address 0x29
 [GLANCE ESP32] VL53L4CD FOUND & Initialized successfully (status=0)
 [GLANCE ESP32] Advertising as Glance-ESP32
 ```
 
----
-
-### Step 3: Run the Flutter Application
+### 2. Run the Flutter App
 
 ```bash
-# Verify static analysis
+# Clone the repository
+git clone https://github.com/reva-hattekar/Glance.git
+cd Glance
+
+# Install Flutter packages
+flutter pub get
+
+# Check code
 flutter analyze
 
-# Launch on connected Android device
+# Run on connected phone
 flutter run --release
 ```
 
 ---
 
-## 14. Testing & Verification Checklist
+## 16. Testing Checklist
 
-- [x] **Static Analysis**: `flutter analyze` passes with 0 issues.
-- [x] **Release Build**: `flutter build apk --release` completes successfully.
-- [x] **BLE Auto-Connect**: App automatically discovers `Glance-ESP32` and subscribes to distance notifications.
-- [x] **ToF Ranging**: Live laser distance appears in camera overlay as `Distance X.XX m • SENSOR`.
-- [x] **Sensor Fallback**: Disconnecting ESP32 seamlessly switches distance label to `• CAMERA`.
-- [x] **RF Beacon Scanner**: Nearby BLE wearables appear dynamically in the Smart Glasses Radar card.
-- [x] **Gated Simulation**: Changing simulation sliders does not calculate risk until `CALCULATE` is tapped.
-- [x] **Alarm Synchronization**: Triggering High Risk or SOS activates phone alarm and ESP32 motor simultaneously.
-- [x] **Disarm Protocol**: Tapping `DISARM` cancels phone alarm and sends `ALARM_OFF` to halt ESP32 motor.
-
----
-
-## 15. Known Limitations & Future Work
-
-### Limitations
-* **Dataset Scope**: Visual classification accuracy is tied to the diversity of the training set. Edge cases with tinted or oversized designer eyewear may require multi-modal corroboration.
-* **Laser Sensor Field of View**: The VL53L4CD has an approximate $18^\circ$ field of view, requiring the user to orient the sensor generally toward the subject.
-* **BLE Ambiguity**: Bluetooth signals confirm proximity to active electronics but cannot conclusively prove an active video stream is recording.
-
-### Future Roadmap
-* **Custom Miniaturized PCB**: Design an integrated pendant or clip-on wearable enclosure housing the ESP32, ToF sensor, and LiPo battery.
-* **Expanded Dataset**: Incorporate diverse lighting conditions and emerging commercial smart-glasses form factors.
-* **Acoustic & Ultrasound Sensing**: Explore ultra-wideband (UWB) or acoustic signature analysis for enhanced proximity verification.
+* [x] **Camera detection**: Face bounding box and head orientation track smoothly.
+* [x] **Smart-glasses classification**: Displays raw probability and classification badge (`CLEAR` vs `👓 DETECTED` at 30%).
+* [x] **Normal glasses testing**: Verified that regular glasses alone do not trigger High Risk alerts.
+* [x] **BLE discovery**: Nearby devices appear in the radar card with live RSSI.
+* [x] **ESP32 connection**: App automatically connects to `Glance-ESP32` upon startup.
+* [x] **ToF distance**: Valid distance stream displayed with `• SENSOR` label.
+* [x] **Camera fallback distance**: Automatically activates with `• CAMERA` label when ESP32 is disconnected.
+* [x] **Simulation calculation**: Sliders do not trigger alerts until `CALCULATE` is tapped.
+* [x] **High-risk alert**: Reaching $\ge 75\%$ triggers phone siren and vibration.
+* [x] **ESP32 vibration**: High Risk sends `ALARM_ON` and pulses the physical motor.
+* [x] **Disarm**: Tapping `DISARM` stops phone alarm and sends `ALARM_OFF` to halt the motor.
+* [x] **BLE reconnection**: Power cycling the ESP32 automatically reconnects within a few seconds.
 
 ---
 
-## 16. Privacy & Ethical Use
+## 17. Limitations
 
-Glance is developed strictly as an assistive situational awareness prototype. All video frames, sensor streams, and RF packets are processed **ephemerally on-device** in local memory. No camera feeds, facial identities, or tracking telemetry are stored or transmitted over external networks.
-
----
-
-## 17. Acknowledgements
-
-* **Google DeepMind & Flutter Team** for cross-platform app frameworks.
-* **Google ML Kit** for on-device computer vision primitives.
-* **STMicroelectronics** for the STM32 VL53L4CD Time-of-Flight ranging platform.
-* **TensorFlow Lite Team** for on-device deep learning runtime support.
+* **Visual model scope**: The classifier is trained on a small dataset (403 images). It can make mistakes on unusual or heavily tinted frames.
+* **Similar appearance**: Some thick or modern regular glasses look visually similar to smart glasses.
+* **BLE evidence**: The presence of a Bluetooth signal indicates a nearby active device, but cannot determine what that device is doing.
+* **Sensor field of view**: The VL53L4CD sensor has an approximate $18^\circ$ field of view and must be oriented generally toward the person.
+* **Camera distance is an estimate**: When falling back to camera distance, head angle and individual face sizes can cause variation.
+* **Prototype hardware**: The current ESP32 setup is built on breadboard/prototyping wires and is not yet packaged into a consumer wearable.
 
 ---
 
-## 18. License
+## 18. Future Improvements
 
-No license has currently been specified. All rights reserved by project maintainers.
+* **Larger dataset**: Collect more training images across diverse lighting, angles, and emerging smart-glasses models.
+* **Custom wearable PCB**: Design a compact, battery-powered pendant or clip-on enclosure.
+* **Better BLE fingerprinting**: Improve identification of specific wearable device broadcast patterns.
+* **Refined sensor fusion**: Incorporate temporal smoothing to reduce frame-to-frame probability fluctuations.
+* **Low-power optimization**: Optimize ESP32 deep sleep and BLE advertising intervals for all-day battery life.
+
+---
+
+## 19. Privacy
+
+Glance processes camera frames and sensor streams locally in real time on the device. It does not store images, record video, or transmit telemetry over the internet. The system does not attempt to recognize or identify individuals.
+
+---
+
+## 20. Acknowledgements
+
+* **Flutter** and **Dart** for the mobile app framework
+* **TensorFlow Lite** for mobile neural network inference
+* **Google ML Kit** for on-device face detection
+* **flutter_blue_plus** for BLE communication
+* **STMicroelectronics** for the VL53L4CD Time-of-Flight sensor and Arduino driver library
