@@ -133,6 +133,28 @@ The model was evaluated on a held-out test dataset of images collected and organ
 
 20 of the 23 smart-glasses samples in the held-out test set were correctly detected. The model is intended as one input to the overall system rather than a standalone decision-maker. The relatively high recall at the selected threshold is useful because possible detections can be verified against distance, BLE, and other contextual signals.
 
+### Understanding the Current Model Performance
+
+The current model was trained and evaluated on a relatively small dataset of 403 images. Smart glasses vary considerably in frame shape, size, camera placement, lighting, reflections, viewing angle, distance from the camera, and image quality. The current dataset cannot yet represent all of these real-world variations, which limits the classifier's generalization.
+
+Key considerations regarding the current results:
+
+* **Prototype Baseline**: The model is a prototype and is not intended to be a standalone smart-glasses detector.
+* **Dataset Scope**: The dataset is relatively small compared with the large variation in real-world eyewear.
+* **Recall Priority**: The model prioritizes recall (86.96%) because missing a possible smart-glasses case is more undesirable for this application than generating an occasional visual false positive.
+* **Multi-Modal Shielding**: The visual classifier is only one input to Glance's overall risk engine. Visual predictions are combined with distance, BLE evidence, orientation, interaction duration, and movement before a High Risk alert is triggered.
+* **False-Positive Safety**: Because visual detection contributes at most 20 points to the risk score, a visual false positive does not automatically mean that the system will trigger an alarm.
+* **Current Baseline**: The current results (Accuracy: 78.69%, Precision: 66.67%, Recall: 86.96%, F1: 75.47%, ROC-AUC: 86.96%) provide a baseline for the prototype, while a larger and more diverse dataset is the main path for improving the classifier.
+
+#### Future Dataset Improvements
+
+* Adding more smart-glasses models and designs
+* Collecting more normal and regular eyewear samples
+* Capturing varying lighting conditions (glare, shadows, backlighting)
+* Testing different camera angles and subject distances
+* Gathering more real-world, in-the-wild images
+* Building a larger and more balanced dataset
+
 ---
 
 ## 6. Multi-Factor Risk Engine
